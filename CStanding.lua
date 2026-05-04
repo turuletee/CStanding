@@ -15,18 +15,6 @@ local PERCENTILES = {
     { pct =  2.5,  score = 3432 },
     { pct =    5,  score = 3318 },
     { pct =   10,  score = 3156 },
-},
-    { pct =  0.5,  score = 3644 },
-    { pct =    1,  score = 3557 },
-    { pct =  2.5,  score = 3432 },
-    { pct =    5,  score = 3318 },
-    { pct =   10,  score = 3156 },
-},
-    { pct =  0.5,  score = 3644 },
-    { pct =    1,  score = 3557 },
-    { pct =  2.5,  score = 3432 },
-    { pct =    5,  score = 3318 },
-    { pct =   10,  score = 3156 },
 }
 
 local FRAME_W, FRAME_H = 170, 28

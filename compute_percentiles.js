@@ -100,17 +100,14 @@ function patchAddonFile(cutoffs, totalRecords, date) {
 
     const block = header + '\n' + '-- ' + '─'.repeat(76) + '\n' + table;
 
-    // Replace everything from the comment block down to the closing }
-    const replaced = lua.replace(
-        /-- Percentile thresholds[\s\S]*?^local PERCENTILES = \{[\s\S]*?\}/m,
-        block
-    );
+    // \n} matches only the outer closing brace — inner entries all end with },
+    const pattern = /-- Percentile thresholds[\s\S]*?\nlocal PERCENTILES = \{[\s\S]*?\n\}/;
 
-    if (replaced === lua) {
+    if (!pattern.test(lua)) {
         throw new Error('Could not locate PERCENTILES block in CStanding.lua — pattern not matched.');
     }
 
-    fs.writeFileSync(ADDON_LUA, replaced, 'utf8');
+    fs.writeFileSync(ADDON_LUA, lua.replace(pattern, block), 'utf8');
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────
