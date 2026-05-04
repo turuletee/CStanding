@@ -2,19 +2,20 @@
 'use strict';
 
 // CStanding Percentile Updater
-// Reads the RaiderIO binary lookup, computes exact percentile cutoff scores,
-// and patches them directly into CStanding.lua.
+// Reads the RaiderIO binary lookup, builds an exact score→percentile map
+// from the full character histogram, and patches it into CStanding.lua.
 
 const fs   = require('fs');
 const path = require('path');
 
-const ADDON_DIR   = path.dirname(process.execPath.endsWith('.exe') ? process.execPath : __filename);
 const WOW_ADDONS  = 'C:\\Program Files (x86)\\World of Warcraft\\_retail_\\Interface\\AddOns';
 const LOOKUP_FILE = path.join(WOW_ADDONS, 'RaiderIO', 'db', 'db_mythicplus_us_lookup.lua');
 const ADDON_LUA   = path.join(WOW_ADDONS, 'CStanding', 'CStanding.lua');
 
-const RECORD_SIZE        = 30;
-const PERCENTILE_TARGETS = [0.1, 0.5, 1.0, 2.5, 5.0, 10.0];
+const RECORD_SIZE   = 30;
+const BLOCK_START   = '-- [[CStanding:dist:start]]';
+const BLOCK_END     = '-- [[CStanding:dist:end]]';
+const MAX_PCT       = 10.5;   // include scores up to this percentile in the table
 
 // ─── Lua string decoder ───────────────────────────────────────────────────
 function decodeLuaString(raw) {
@@ -84,27 +85,26 @@ function extractChunks(fileContent) {
 }
 
 // ─── Patch CStanding.lua ─────────────────────────────────────────────────
-function patchAddonFile(cutoffs, totalRecords, date) {
+function patchAddonFile(luaTable, totalRecords, date) {
     const lua = fs.readFileSync(ADDON_LUA, 'utf8');
 
-    const header =
-        `-- Percentile thresholds for Midnight Season 1 (US region, ${totalRecords.toLocaleString()} tracked chars)\n` +
-        `-- Computed from RaiderIO binary lookup by CStanding Updater on ${date}.\n` +
-        `-- Re-run UpdateStandings.exe after each RaiderIO update to keep these current.`;
+    const block = [
+        BLOCK_START,
+        `-- Score distribution for Midnight Season 1 (US region, ${totalRecords.toLocaleString()} tracked chars)`,
+        `-- Computed from RaiderIO binary lookup by CStanding Updater on ${date}.`,
+        `-- Re-run UpdateStandings.exe after each RaiderIO update to keep these current.`,
+        `-- score -> top percentile (stored at 2dp, displayed at 1dp). Top ~10% range only.`,
+        `local SCORE_DIST = {`,
+        luaTable,
+        `}`,
+        BLOCK_END,
+    ].join('\n');
 
-    let table = 'local PERCENTILES = {\n';
-    for (const { pct, score } of cutoffs) {
-        table += `    { pct = ${String(pct).padStart(4)},  score = ${String(score).padStart(4)} },\n`;
-    }
-    table += '}';
-
-    const block = header + '\n' + '-- ' + '─'.repeat(76) + '\n' + table;
-
-    // \n} matches only the outer closing brace — inner entries all end with },
-    const pattern = /-- Percentile thresholds[\s\S]*?\nlocal PERCENTILES = \{[\s\S]*?\n\}/;
+    const escaped = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(escaped(BLOCK_START) + '[\\s\\S]*?' + escaped(BLOCK_END));
 
     if (!pattern.test(lua)) {
-        throw new Error('Could not locate PERCENTILES block in CStanding.lua — pattern not matched.');
+        throw new Error('Could not locate distribution block in CStanding.lua.\nMake sure the sentinel comments are present.');
     }
 
     fs.writeFileSync(ADDON_LUA, lua.replace(pattern, block), 'utf8');
@@ -133,33 +133,52 @@ function main() {
     const totalRecords = Math.floor(data.length / RECORD_SIZE);
     console.log('  Characters: ' + totalRecords.toLocaleString());
 
-    // 2. Extract scores (first 13 bits of each 30-byte record)
-    console.log('\nDecoding scores...');
-    const scores = new Uint16Array(totalRecords);
+    // 2. Build score histogram (first 13 bits of each 30-byte record)
+    console.log('\nBuilding score histogram...');
+    const histogram = new Uint32Array(8192); // 13-bit scores: 0–8191
     for (let i = 0; i < totalRecords; i++) {
         const base = i * RECORD_SIZE;
-        scores[i] = data[base] | ((data[base + 1] & 0x1F) << 8);
+        histogram[data[base] | ((data[base + 1] & 0x1F) << 8)]++;
     }
 
-    scores.sort();
-
-    let firstNonZero = 0;
-    while (firstNonZero < totalRecords && scores[firstNonZero] === 0) firstNonZero++;
-
-    console.log('  Score range: ' + scores[firstNonZero] + ' – ' + scores[totalRecords - 1]);
-
-    // 3. Compute cutoffs
-    const cutoffs = PERCENTILE_TARGETS.map(pct => ({
-        pct,
-        score: scores[Math.floor(totalRecords * (1 - pct / 100))],
-    }));
-
-    console.log('\nPercentile cutoffs:');
-    for (const { pct, score } of cutoffs) {
-        console.log('  Top ' + String(pct).padEnd(5) + '% → ' + score);
+    // Find actual max score
+    let maxScore = 0;
+    for (let s = 8191; s >= 0; s--) {
+        if (histogram[s] > 0) { maxScore = s; break; }
     }
 
-    // 4. Patch CStanding.lua
+    // 3. Compute cumulative top-percentile for each integer score, descending
+    //    cumulative after processing score s = count of players with score >= s
+    console.log('Computing distribution...');
+    const distEntries = []; // [score, pct_string]
+    let cumulative = 0;
+
+    for (let s = maxScore; s >= 0; s--) {
+        cumulative += histogram[s];
+        const pct = cumulative / totalRecords * 100;
+        if (pct > MAX_PCT) break;
+        distEntries.push([s, pct.toFixed(2)]);
+    }
+
+    // distEntries is ordered high→low score (low→high pct)
+    // Summary
+    const topEntry  = distEntries[0];
+    const botEntry  = distEntries[distEntries.length - 1];
+    console.log('  Score range in table: ' + botEntry[0] + ' – ' + topEntry[0]);
+    console.log('  Entries: ' + distEntries.length);
+    console.log('  Sample cutoffs:');
+    for (const pctTarget of [0.1, 0.5, 1, 2.5, 5, 10]) {
+        const entry = distEntries.find(([, p]) => parseFloat(p) >= pctTarget);
+        if (entry) console.log('    Top ' + String(pctTarget).padEnd(5) + '% → ' + entry[0]);
+    }
+
+    // 4. Build compact Lua table string
+    //    One entry per line: "    [SCORE]=PCT,"
+    const luaTable = distEntries
+        .map(([s, p]) => `    [${s}]=${p},`)
+        .join('\n');
+
+    // 5. Patch CStanding.lua
     console.log('\nUpdating CStanding.lua...');
     if (!fs.existsSync(ADDON_LUA)) {
         console.error('ERROR: CStanding.lua not found:\n  ' + ADDON_LUA);
@@ -167,8 +186,7 @@ function main() {
     }
 
     const date = new Date().toISOString().slice(0, 10);
-    patchAddonFile(cutoffs, totalRecords, date);
-
+    patchAddonFile(luaTable, totalRecords, date);
     console.log('  Done! Reload your UI in-game (/reload) to apply.\n');
 }
 
